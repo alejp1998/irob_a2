@@ -1,14 +1,12 @@
 #! /usr/bin/env python3
 
 """
-    # Alejandro Jarabo Peñas
+    # Alejandro Jarabo
     # aljp@kth.se
 """
 
 from math import sin, asin, cos, acos, atan2, pi
 import numpy as np
-import tf2_ros as tf
-import rospy
 
 def scara_IK(point):
     x = point[0]
@@ -46,9 +44,6 @@ def scara_IK(point):
     return q
 
 def kuka_IK(point, R, joint_positions):
-    x = point[0]
-    y = point[1]
-    z = point[2]
     q = joint_positions #it must contain 7 elements
 
     # BASE LINK LENGTH
@@ -65,19 +60,19 @@ def kuka_IK(point, R, joint_positions):
     a     = [   0,     0,     0,    0,    0,     0,   0]
 
     # Tolerance
-    tol = 0.0001
-    eps_x = np.ones(6)
-    rate = rospy.Rate(100)
+    tol = 0.001
 
-    #Desired x = [x, y, z, ...]
+    #Desired pose from R and point
     R = np.array(R)
-    theta = -asin(R[2,0])
-    psi = atan2(R[2,1]/cos(theta), R[2,2]/cos(theta))
-    phi = atan2(R[1,0]/cos(theta), R[0,0]/cos(theta))
-    euler_desired = [psi, theta, phi]
-    x_desired = np.hstack((np.array(point), euler_desired))
+    n_d = np.array(R[:3,0])
+    o_d = np.array(R[:3,1])
+    a_d = np.array(R[:3,2])
+    x_d = np.array(point)
+    
+    not_small_enough_eps = True
+    while not_small_enough_eps :
+        not_small_enough_eps = False
 
-    while abs(max(eps_x)) > tol :
         # Create transformation matrices between two links 
         # according to Modified DH convention with given parameters  
         Ts = [np.array([
@@ -85,81 +80,95 @@ def kuka_IK(point, R, joint_positions):
                 [ sin(q[i]),  cos(q[i])*cos(alpha[i]),  -cos(q[i])*sin(alpha[i]),  a[i]*sin(alpha[i])],
                 [         0,            sin(alpha[i]),             cos(alpha[i]),                d[i]],
                 [         0,                        0,                         0,                   1]
-         ]) for i in range(len(q)) ]
+        ]) for i in range(len(q)) ]
         
         #BASE LENGTH TRANSFORM 
         base_translation = np.eye(4)
         base_translation[2,3] = B
-        # FINAL TRANSFORMS 
-        TB1, T12, T23, T34, T45, T56, T67 = Ts[0], Ts[1], Ts[2], Ts[3], Ts[4], Ts[5], Ts[6]
         # END EFFECTOR TRANSFORM
         end_effector_translation = np.eye(4)
         end_effector_translation[2,3] = E
 
-        # TRANSFORM FROM BASE TO END-EFFECTOR
-        TB_st = np.dot(base_translation, TB1)
-        TB2 = np.dot(TB_st, T12)
-        TB3 = np.dot(TB2, T23)
-        TB4 = np.dot(TB3, T34)
-        TB5 = np.dot(TB4, T45)
-        TB6 = np.dot(TB5, T56)
-        TB7 = np.dot(TB6, T67)
-        TBE = np.dot(TB7, end_effector_translation)
+        # FINAL TRANSFORM MATRIX AND JACOBIAN PARAMETERS
+        # Jacobian Params
+        pose_p = np.zeros(shape = (7, 3, 1))
+        J_o = np.zeros(shape = (7, 3, 1))
+        J_p = np.zeros(shape = (7, 3, 1))
+        J = np.zeros(shape = (6, 7))
+        # Transform from 0 to 7
+        T07 = np.eye(4) 
+        for i in range(len(q)) :
+            J_o[i] = T07[:3, [2]]
+            pose_p[i] = T07[:3, [3]]
+            T07 = np.dot(T07,Ts[i])
+        # Transform from 0 to End-Effector
+        T0E = np.dot(T07,end_effector_translation)
+        # Transform from Base to End-Effector
+        TBE = np.dot(base_translation,T0E)
+        
+        # End-Effector Transformed Rotation
+        n_e = TBE[:3, [0]]
+        o_e = TBE[:3, [1]]
+        a_e = TBE[:3, [2]]
+        
+        # Computation of Jacobian and Pseudo-Inverse Jacobian
+        pose_e = T0E[:3, [3]]
+        for i in range(len(q)) :
+            J_p[i] = np.transpose(np.cross(np.transpose(J_o[i]), np.transpose(pose_e - pose_p[i])))
+        for i in range(len(q)) :
+            for j in range(len(point)) :
+                J[j][i] = J_p[i][j][0]
+                J[j+3][i] = J_o[i][j][0]
+        
+        J_pseudo_inv = np.dot(np.transpose(J), (np.linalg.inv(np.dot(J, np.transpose(J)))))
 
-        # TRANSLATION VECTORS
-        p = []
-        p.append(TB_st[0:3, 3])
-        p.append(TB2[0:3, 3])
-        p.append(TB3[0:3, 3])
-        p.append(TB4[0:3, 3])
-        p.append(TB5[0:3, 3])
-        p.append(TB6[0:3, 3])
-        p.append(TB7[0:3, 3])
-        p.append(TBE[0:3, 3])
+        # Compute current pose
+        x_c = np.array(TBE[:3, 3])
 
-        # Z ROTATION VECTORS
-        z = []
-        z.append(TB_st[0:3, 2])
-        z.append(TB2[0:3, 2])
-        z.append(TB3[0:3, 2])
-        z.append(TB4[0:3, 2])
-        z.append(TB5[0:3, 2])
-        z.append(TB6[0:3, 2])
-        z.append(TB7[0:3, 2])
-        z.append(TBE[0:3, 2])
+        # Position error
+        eps_x = x_c - x_d
+        eps_x = np.array([[eps_x[0]], [eps_x[1]],[eps_x[2]]])
 
-        # COMPUTE EULER ANGLES: psi, theta and phi
-        # Rotation matrix
-        R = TBE[0:3, 0:3]
+        # Orientation error
+        eps_n = np.cross(np.transpose(n_e), np.transpose(n_d))
+        eps_o = np.cross(np.transpose(o_e), np.transpose(o_d))
+        eps_a = np.cross(np.transpose(a_e), np.transpose(a_d))
+        eps_o = 0.5*np.transpose(eps_n + eps_o + eps_a)
 
-        # Euler angles estimation
-        theta = -asin(R[2,0])
-        psi = atan2(R[2,1]/cos(theta), R[2,2]/cos(theta))
-        phi = atan2(R[1,0]/cos(theta), R[0,0]/cos(theta))
+        # Complete pose error
+        eps_pose = np.append(eps_x, eps_o, axis=0)
 
-        euler_hat = [psi, theta, phi]
+        # Joint angle error from pose error
+        eps_joint_angle = np.dot(J_pseudo_inv, eps_pose)
 
-        # Position estimation
-        x_hat = np.hstack((np.array([TBE[0][3], TBE[1][3], TBE[2][3]]),euler_hat))
-        # Calculate position error
-        eps_x = x_hat - x_desired
-
-        # Calculate Jacobian
-        J = []
+        # New q values
         for i in range(len(q)) : 
-            J_temp = np.cross(z[i], (p[-1] - p[i]))
-            J.append(np.hstack((J_temp, z[i])))
-        J = np.array(J)
+            q[i] = float(simplify_angle(q[i] - eps_joint_angle[i][0]))
 
-        # Calculate pose error
-        J_pseudo_inv = np.linalg.pinv(J.T)
-        eps_theta = np.matmul(J_pseudo_inv, eps_x)
+        # Check if eps is smaller than tolerance
+        pose_error = np.linalg.norm(eps_pose)
+        print('Pose error: {}'.format(pose_error))
+        if pose_error > tol : 
+            not_small_enough_eps = True
 
-        # Obtain new pose estimation
-        q = q - eps_theta
         print('New q: ')
         print(q)
-        rate.sleep()
 
-
+    print('Final q : ')
+    print(q)
+    
     return q
+
+def simplify_angle(theta) :
+    while (theta >= pi) or (theta < -pi) :
+        if theta >= pi : 
+            theta = theta - 2*pi
+        elif theta < -pi :
+            theta = theta + 2*pi
+
+    return theta
+
+
+# Test IK function
+kuka_IK([-0.123, 0., 0.42], [[0, 0, -1], [0, 1, 0], [1, 0, 0]], [0, 1.11, 0, 1.1, 0, 1.52, 0])
+
